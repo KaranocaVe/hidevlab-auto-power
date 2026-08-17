@@ -4,6 +4,8 @@
 // @version      1.3.0
 // @description  自动识别 HiDevLab 开发环境，防止页面休眠，按用户勾选的目标循环重试开机并记录完整日志。
 // @match        https://hidevlab.huawei.com/online-develop*
+// @updateURL    https://raw.githubusercontent.com/KaranocaVe/hidevlab-auto-power/main/hidevlab-auto-power.user.js
+// @downloadURL  https://raw.githubusercontent.com/KaranocaVe/hidevlab-auto-power/main/hidevlab-auto-power.user.js
 // @run-at       document-idle
 // @grant        GM_getValue
 // @grant        GM_setValue
