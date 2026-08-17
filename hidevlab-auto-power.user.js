@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         HiDevLab 自动开机/抢卡助手
 // @namespace    https://hidevlab.huawei.com/
-// @version      1.2.0
-// @description  自动识别 HiDevLab 开发环境，按用户勾选的目标循环关闭调度提示并重试开机。
+// @version      1.3.0
+// @description  自动识别 HiDevLab 开发环境，防止页面休眠，按用户勾选的目标循环重试开机并记录完整日志。
 // @match        https://hidevlab.huawei.com/online-develop*
 // @run-at       document-idle
 // @grant        GM_getValue
@@ -15,12 +15,16 @@
 
   const STORAGE_KEY = 'hidevlab-auto-power-settings-v1';
   const PANEL_ID = 'hidevlab-auto-power-panel';
+  const MAX_LOG_ENTRIES = 2000;
   const DEFAULTS = {
     intervalMs: 2500,
     retryDelayMs: 100,
     selectedNames: [],
     stopOnSuccess: true,
     autoConfirm: true,
+    keepAwake: true,
+    panelCollapsed: false,
+    panelPosition: null,
   };
 
   const state = {
@@ -35,6 +39,15 @@
     successNotified: new Set(),
     observer: null,
     targetRefreshTimer: null,
+    attempts: 0,
+    logEntries: [],
+    summaryLogs: [],
+    logView: 'summary',
+    wakeLock: null,
+    heartbeatTimer: null,
+    wakeLockRetryTimer: null,
+    panelHost: null,
+    dragState: null,
   };
 
   const settings = loadSettings();
@@ -192,6 +205,35 @@
     }, 120);
   }
 
+  function renderLogs() {
+    const logBox = shadowRoot?.querySelector('[data-role="log"]');
+    const logCount = shadowRoot?.querySelector('[data-role="log-count"]');
+    const toggleButton = shadowRoot?.querySelector('[data-action="toggle-log"]');
+    if (!logBox) return;
+
+    const entries = state.logView === 'full'
+      ? state.logEntries
+      : state.summaryLogs;
+    logBox.replaceChildren();
+    for (const entry of entries) {
+      const item = document.createElement('div');
+      item.dataset.kind = entry.kind;
+      if (state.logView === 'full') {
+        item.textContent = `${entry.time} ${entry.message}`;
+      } else {
+        const repeat = entry.count > 1 ? ` ×${entry.count}` : '';
+        const range = entry.firstTime === entry.lastTime
+          ? entry.firstTime
+          : `${entry.firstTime}–${entry.lastTime}`;
+        item.textContent = `${range}${repeat} ${entry.message}`;
+      }
+      logBox.appendChild(item);
+    }
+    if (logCount) logCount.textContent = `${state.logEntries.length} 条`;
+    if (toggleButton) toggleButton.textContent = state.logView === 'full' ? '显示摘要' : '查看完整日志';
+    logBox.scrollTop = logBox.scrollHeight;
+  }
+
   function setStatus(message, kind = 'info') {
     const status = shadowRoot?.querySelector('[data-role="status"]');
     if (!status) return;
@@ -200,17 +242,102 @@
   }
 
   function log(message, kind = 'info') {
-    const line = `${new Date().toLocaleTimeString()} ${message}`;
-    console.info(`[HiDevLab 助手] ${message}`);
-    const logBox = shadowRoot?.querySelector('[data-role="log"]');
-    if (logBox) {
-      const item = document.createElement('div');
-      item.textContent = line;
-      item.dataset.kind = kind;
-      logBox.prepend(item);
-      while (logBox.children.length > 8) logBox.lastElementChild.remove();
+    const time = new Date().toLocaleTimeString();
+    const entry = { time, message, kind };
+    state.logEntries.push(entry);
+    if (state.logEntries.length > MAX_LOG_ENTRIES) state.logEntries.shift();
+
+    const key = `${kind}:${message}`;
+    const last = state.summaryLogs[state.summaryLogs.length - 1];
+    if (last && last.key === key) {
+      last.count += 1;
+      last.lastTime = time;
+    } else {
+      state.summaryLogs.push({ key, time, firstTime: time, lastTime: time, message, kind, count: 1 });
+      if (state.summaryLogs.length > 400) state.summaryLogs.shift();
     }
+
+    console.info(`[HiDevLab 助手] ${message}`);
+    renderLogs();
     setStatus(message, kind);
+  }
+
+  function toggleLogView() {
+    state.logView = state.logView === 'full' ? 'summary' : 'full';
+    renderLogs();
+  }
+
+  function setAwakeStatus(message, kind = 'info') {
+    const status = shadowRoot?.querySelector('[data-role="awake"]');
+    if (!status) return;
+    status.textContent = message;
+    status.dataset.kind = kind;
+  }
+
+  function scheduleWakeLockRetry() {
+    if (state.wakeLockRetryTimer || !state.running || !settings.keepAwake) return;
+    state.wakeLockRetryTimer = setTimeout(() => {
+      state.wakeLockRetryTimer = null;
+      requestWakeLock();
+    }, 5000);
+  }
+
+  async function requestWakeLock() {
+    if (!state.running || !settings.keepAwake) return;
+    if (!('wakeLock' in navigator)) {
+      setAwakeStatus('浏览器不支持 Wake Lock', 'warn');
+      return;
+    }
+    if (document.visibilityState !== 'visible') {
+      setAwakeStatus('页面后台，等待回到前台保活', 'warn');
+      return;
+    }
+    if (state.wakeLock && !state.wakeLock.released) return;
+    try {
+      state.wakeLock = await navigator.wakeLock.request('screen');
+      state.wakeLock.addEventListener('release', () => {
+        state.wakeLock = null;
+        if (state.running) {
+          setAwakeStatus('保活已释放，正在重试', 'warn');
+          scheduleWakeLockRetry();
+        }
+      });
+      setAwakeStatus('Wake Lock 保活中', 'success');
+    } catch (error) {
+      state.wakeLock = null;
+      setAwakeStatus(`保活申请失败：${error?.message || '浏览器拒绝'}`, 'warn');
+      scheduleWakeLockRetry();
+    }
+  }
+
+  function startKeepAwake() {
+    if (!settings.keepAwake) {
+      setAwakeStatus('保活未启用', 'info');
+      return;
+    }
+    requestWakeLock();
+    if (!state.heartbeatTimer) {
+      state.heartbeatTimer = setInterval(() => {
+        if (!state.running) return;
+        if (document.visibilityState === 'visible') requestWakeLock();
+      }, 15000);
+    }
+  }
+
+  async function stopKeepAwake() {
+    if (state.heartbeatTimer) clearInterval(state.heartbeatTimer);
+    if (state.wakeLockRetryTimer) clearTimeout(state.wakeLockRetryTimer);
+    state.heartbeatTimer = null;
+    state.wakeLockRetryTimer = null;
+    if (state.wakeLock) {
+      try {
+        await state.wakeLock.release();
+      } catch (error) {
+        console.debug('[HiDevLab 助手] 释放 Wake Lock 失败', error);
+      }
+    }
+    state.wakeLock = null;
+    setAwakeStatus('保活已停止', 'info');
   }
 
   function sendNotification(title, body) {
@@ -295,6 +422,7 @@
     if (state.tickTimer) clearInterval(state.tickTimer);
     state.tickTimer = null;
     state.ticking = false;
+    stopKeepAwake();
     updateControls();
     log(reason, 'info');
   }
@@ -329,6 +457,8 @@
     const now = Date.now();
     if (!force && now - state.lastActionAt < Math.max(1500, Number(settings.intervalMs) || DEFAULTS.intervalMs)) return false;
     state.lastActionAt = now;
+    state.attempts += 1;
+    updateControls();
     state.pendingName = candidate.name;
     state.pendingSince = now;
     state.manualConfirmPending = false;
@@ -416,8 +546,10 @@
     state.pendingName = null;
     state.pendingSince = 0;
     state.successNotified.clear();
+    state.attempts = 0;
     updateControls();
-    log(`已开始：每 ${Math.max(1500, settings.intervalMs)}ms 检查一次。`, 'action');
+    log(`开始新一轮抢卡：每 ${Math.max(1500, settings.intervalMs)}ms 检查一次，尝试计数已重置。`, 'action');
+    startKeepAwake();
     tick();
     state.tickTimer = setInterval(tick, Math.max(1500, settings.intervalMs));
   }
@@ -426,12 +558,98 @@
     const startButton = shadowRoot?.querySelector('[data-action="start"]');
     const stopButton = shadowRoot?.querySelector('[data-action="stop"]');
     const stateBadge = shadowRoot?.querySelector('[data-role="running"]');
+    const attemptBadge = shadowRoot?.querySelector('[data-role="attempts"]');
     if (startButton) startButton.disabled = state.running;
     if (stopButton) stopButton.disabled = !state.running;
     if (stateBadge) {
       stateBadge.textContent = state.running ? '运行中' : '已停止';
       stateBadge.dataset.running = String(state.running);
     }
+    if (attemptBadge) attemptBadge.textContent = `尝试 ${state.attempts}`;
+  }
+
+  function setPanelPosition(x, y, persist = true) {
+    const host = state.panelHost;
+    if (!host) return;
+    const rect = host.getBoundingClientRect();
+    const maxX = Math.max(0, window.innerWidth - rect.width);
+    const maxY = Math.max(0, window.innerHeight - rect.height);
+    const nextX = Math.min(Math.max(0, Number(x) || 0), maxX);
+    const nextY = Math.min(Math.max(0, Number(y) || 0), maxY);
+    host.style.left = `${Math.round(nextX)}px`;
+    host.style.top = `${Math.round(nextY)}px`;
+    host.style.right = 'auto';
+    host.style.bottom = 'auto';
+    if (persist) {
+      settings.panelPosition = { x: nextX, y: nextY };
+      saveSettings();
+    }
+  }
+
+  function applyPanelCollapsed() {
+    const panel = shadowRoot?.querySelector('.panel');
+    const button = shadowRoot?.querySelector('[data-action="toggle-collapse"]');
+    if (!panel || !button) return;
+    panel.classList.toggle('collapsed', Boolean(settings.panelCollapsed));
+    button.textContent = settings.panelCollapsed ? '展开' : '收起';
+    button.setAttribute('aria-expanded', String(!settings.panelCollapsed));
+    requestAnimationFrame(() => {
+      if (!state.panelHost) return;
+      const rect = state.panelHost.getBoundingClientRect();
+      setPanelPosition(rect.left, rect.top, false);
+    });
+  }
+
+  function setupPanelInteractions() {
+    const head = shadowRoot?.querySelector('.head');
+    const collapseButton = shadowRoot?.querySelector('[data-action="toggle-collapse"]');
+    if (!head || !collapseButton || !state.panelHost) return;
+
+    collapseButton.addEventListener('click', (event) => {
+      event.stopPropagation();
+      settings.panelCollapsed = !settings.panelCollapsed;
+      saveSettings();
+      applyPanelCollapsed();
+    });
+
+    const finishDrag = (event) => {
+      if (!state.dragState || state.dragState.pointerId !== event.pointerId) return;
+      try { head.releasePointerCapture(event.pointerId); } catch (error) { /* no-op */ }
+      state.dragState = null;
+      const rect = state.panelHost.getBoundingClientRect();
+      setPanelPosition(rect.left, rect.top, true);
+    };
+
+    head.addEventListener('pointerdown', (event) => {
+      if (event.target?.closest?.('button')) return;
+      const rect = state.panelHost.getBoundingClientRect();
+      state.dragState = {
+        pointerId: event.pointerId,
+        offsetX: event.clientX - rect.left,
+        offsetY: event.clientY - rect.top,
+      };
+      head.setPointerCapture(event.pointerId);
+      event.preventDefault();
+    });
+    head.addEventListener('pointermove', (event) => {
+      if (!state.dragState || state.dragState.pointerId !== event.pointerId) return;
+      setPanelPosition(
+        event.clientX - state.dragState.offsetX,
+        event.clientY - state.dragState.offsetY,
+        false,
+      );
+    });
+    head.addEventListener('pointerup', finishDrag);
+    head.addEventListener('pointercancel', finishDrag);
+    window.addEventListener('resize', () => {
+      const rect = state.panelHost.getBoundingClientRect();
+      setPanelPosition(rect.left, rect.top, false);
+    });
+
+    if (settings.panelPosition) {
+      setPanelPosition(settings.panelPosition.x, settings.panelPosition.y, false);
+    }
+    applyPanelCollapsed();
   }
 
   function bindSettings() {
@@ -439,11 +657,13 @@
     const retryInput = shadowRoot.querySelector('[data-setting="retryDelayMs"]');
     const stopInput = shadowRoot.querySelector('[data-setting="stopOnSuccess"]');
     const confirmInput = shadowRoot.querySelector('[data-setting="autoConfirm"]');
+    const awakeInput = shadowRoot.querySelector('[data-setting="keepAwake"]');
 
     intervalInput.value = String(settings.intervalMs);
     retryInput.value = String(settings.retryDelayMs);
     stopInput.checked = settings.stopOnSuccess;
     confirmInput.checked = settings.autoConfirm;
+    awakeInput.checked = settings.keepAwake;
 
     intervalInput.addEventListener('change', () => {
       settings.intervalMs = Math.max(1500, Number(intervalInput.value) || DEFAULTS.intervalMs);
@@ -463,6 +683,16 @@
       settings.autoConfirm = confirmInput.checked;
       saveSettings();
     });
+    awakeInput.addEventListener('change', () => {
+      settings.keepAwake = awakeInput.checked;
+      saveSettings();
+      if (state.running) {
+        if (settings.keepAwake) startKeepAwake();
+        else stopKeepAwake();
+      } else {
+        setAwakeStatus(settings.keepAwake ? '运行时启用保活' : '保活未启用', 'info');
+      }
+    });
   }
 
   let shadowRoot;
@@ -473,17 +703,24 @@
     host.id = PANEL_ID;
     host.style.cssText = 'all:initial;position:fixed;z-index:2147483647;top:16px;right:16px;';
     document.documentElement.appendChild(host);
+    state.panelHost = host;
     shadowRoot = host.attachShadow({ mode: 'open' });
     shadowRoot.innerHTML = `
       <style>
         :host { all: initial; }
         * { box-sizing: border-box; }
         .panel { width: 360px; color: #1f2937; background: #fff; border: 1px solid #dbe3ef; border-radius: 14px; box-shadow: 0 12px 38px rgba(15, 23, 42, .22); font: 13px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; overflow: hidden; }
-        .head { display:flex; align-items:center; justify-content:space-between; padding: 12px 14px; background: linear-gradient(135deg,#0f4c81,#1565c0); color:#fff; }
+        .head { display:flex; align-items:center; justify-content:space-between; gap:8px; padding: 12px 14px; background: linear-gradient(135deg,#0f4c81,#1565c0); color:#fff; cursor:move; user-select:none; touch-action:none; }
+        .head-title { min-width:0; display:flex; flex-direction:column; gap:2px; }
         .title { font-weight: 700; font-size: 14px; }
-        .badge { padding: 2px 7px; border-radius: 999px; background: rgba(255,255,255,.2); font-size: 11px; }
+        .head-subtitle { font-size:10px; opacity:.78; }
+        .head-actions { display:flex; align-items:center; gap:5px; flex-wrap:wrap; justify-content:flex-end; }
+        .badge, .attempts { padding: 2px 7px; border-radius: 999px; background: rgba(255,255,255,.2); font-size: 11px; white-space:nowrap; }
         .badge[data-running="true"] { background: #16a34a; }
+        .attempts { background: rgba(255,255,255,.14); }
+        .collapse-button { color:#fff; background:rgba(255,255,255,.18); padding:4px 7px; font-size:11px; }
         .body { padding: 12px 14px 14px; }
+        .panel.collapsed .body { display:none; }
         .row { display:grid; grid-template-columns: 108px 1fr; gap:8px; align-items:center; margin: 8px 0; }
         label { color:#475569; }
         input[type="number"], input[type="text"], select { width:100%; min-height:30px; border:1px solid #cbd5e1; border-radius:7px; padding: 4px 8px; font: inherit; color:#0f172a; background:#fff; }
@@ -510,13 +747,18 @@
         .status { min-height: 21px; padding: 6px 8px; border-radius:7px; background:#f1f5f9; color:#475569; }
         .status[data-kind="success"] { background:#dcfce7; color:#166534; }
         .status[data-kind="error"], .status[data-kind="warn"] { background:#fee2e2; color:#991b1b; }
-        .log { max-height: 120px; overflow:auto; margin-top:8px; padding-top:6px; border-top:1px solid #e2e8f0; color:#64748b; font-size:11px; }
+        .awake { margin: 6px 0; color:#64748b; font-size:11px; }
+        .awake[data-kind="success"] { color:#15803d; }
+        .awake[data-kind="warn"] { color:#b45309; }
+        .log-head { display:flex; align-items:center; justify-content:space-between; gap:8px; margin-top:8px; padding-top:6px; border-top:1px solid #e2e8f0; color:#64748b; font-size:11px; }
+        .log-toggle { border:0; padding:2px 5px; color:#2563eb; background:transparent; font-size:11px; cursor:pointer; }
+        .log { max-height: 180px; overflow:auto; margin-top:4px; color:#64748b; font-size:11px; }
         .log div { padding: 2px 0; }
         .log div[data-kind="success"] { color:#15803d; }
         .log div[data-kind="error"], .log div[data-kind="warn"] { color:#b91c1c; }
       </style>
       <section class="panel" aria-label="HiDevLab 自动开机助手">
-        <header class="head"><span class="title">HiDevLab 抢卡助手</span><span class="badge" data-role="running">已停止</span></header>
+        <header class="head" title="拖动此处移动面板"><div class="head-title"><span class="title">HiDevLab 抢卡助手</span><span class="head-subtitle">拖动标题栏移动</span></div><div class="head-actions"><span class="badge" data-role="running">已停止</span><span class="attempts" data-role="attempts">尝试 0</span><button class="collapse-button" data-action="toggle-collapse" aria-expanded="true">收起</button></div></header>
         <div class="body">
           <div class="target-head"><span>自动识别的开发环境</span><span class="target-count" data-role="target-count">已选 0</span></div>
           <div class="target-actions"><button class="target-action" data-action="select-stopped">全选已关机</button><button class="target-action" data-action="clear-selection">清空选择</button></div>
@@ -525,14 +767,19 @@
           <div class="row"><label>关闭后重试(ms)</label><input data-setting="retryDelayMs" type="number" min="50" step="50"></div>
           <label class="check"><input data-setting="autoConfirm" type="checkbox">自动点击“确认开机”</label>
           <label class="check"><input data-setting="stopOnSuccess" type="checkbox">成功后自动停止并通知</label>
+          <label class="check"><input data-setting="keepAwake" type="checkbox">运行时尽量防止标签页休眠</label>
           <div class="buttons"><button class="start" data-action="start">开始抢卡</button><button class="stop" data-action="stop" disabled>停止</button></div>
           <div class="status" data-role="status">脚本已加载，默认不会自动点击。</div>
+          <div class="awake" data-role="awake">运行时启用 Wake Lock 保活</div>
           <div class="hint">遇到“资源调度中”会点关闭并立即重试；只操作页面按钮，不调用隐藏接口。</div>
+          <div class="log-head"><span>日志 <span data-role="log-count">0 条</span></span><button class="log-toggle" data-action="toggle-log">查看完整日志</button></div>
           <div class="log" data-role="log"></div>
         </div>
       </section>`;
 
     bindSettings();
+    setupPanelInteractions();
+    shadowRoot.querySelector('[data-action="toggle-log"]').addEventListener('click', toggleLogView);
     shadowRoot.querySelector('[data-action="select-stopped"]').addEventListener('click', () => {
       settings.selectedNames = getRows().filter((row) => isStoppedStatus(row.status)).map((row) => row.name);
       saveSettings();
@@ -550,6 +797,8 @@
     });
     shadowRoot.querySelector('[data-action="stop"]').addEventListener('click', () => stop());
     refreshTargetList();
+    setAwakeStatus(settings.keepAwake ? '运行时启用 Wake Lock 保活' : '保活未启用', 'info');
+    renderLogs();
     updateControls();
   }
 
@@ -564,6 +813,9 @@
   function init() {
     createPanel();
     observePage();
+    document.addEventListener('visibilitychange', () => {
+      if (state.running) requestWakeLock();
+    });
     log('脚本已加载，默认不会自动点击。', 'info');
   }
 
